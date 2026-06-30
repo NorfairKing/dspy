@@ -109,18 +109,6 @@
         workspace.deps.default // { dspy = [ "dev" ]; }
       );
 
-      # The tests that fetch real URLs over the internet (w3.org PDFs,
-      # images.dog.ceo). Listed once and used both to deselect them from the pure
-      # offline run and to select them for the pure-impure run.
-      networkTests = [
-        "tests/signatures/test_adapter_image.py::test_pdf_url_support"
-        "tests/signatures/test_adapter_image.py::test_different_mime_types"
-        "tests/signatures/test_adapter_image.py::test_mime_type_from_response_headers"
-        "tests/signatures/test_adapter_image.py::test_pdf_from_file"
-        "tests/signatures/test_adapter_image.py::test_image_input_formats"
-        "tests/signatures/test_adapter_image.py::test_predictor_save_load"
-      ];
-
       # ----------------------------------------------------------------------
       # Simple, dependency-light outputs.
       # ----------------------------------------------------------------------
@@ -200,43 +188,15 @@
         '';
       };
 
-      # The default pytest suite, minus the handful of tests that need real
-      # internet access. This is a fully pure, deterministic, network-free build
-      # (the markers reliability/extra/llm_call/deno are skipped by conftest, and
-      # the litellm test server binds to loopback).
-      pytest = pkgs.stdenvNoCC.mkDerivation {
-        name = "dspy-pytest";
-        src = ./.;
-
-        nativeBuildInputs = [ testVenv ];
-
-        dontConfigure = true;
-        dontBuild = true;
-
-        doCheck = true;
-        checkPhase = ''
-          runHook preCheck
-          export HOME="$TMPDIR"
-          # Make the `tests` package importable (root conftest does
-          # `from tests.test_utils...`).
-          export PYTHONPATH="$PWD''${PYTHONPATH:+:$PYTHONPATH}"
-          python -m pytest -p no:cacheprovider -vv tests/ \
-            ${lib.concatMapStringsSep " \\\n            " (t: ''--deselect "${t}"'') networkTests}
-          runHook postCheck
-        '';
-
-        installPhase = ''
-          mkdir -p "$out"
-        '';
-      };
-
-      # The internet-dependent tests, run with the pure-impure trick so they
-      # still execute inside `nix flake check` (the fixed-output derivation is
-      # granted network access). Kept as a small separate derivation so the heavy
-      # offline suite above stays a normal, fully reproducible pure build.
-      pytestNetwork = makePureImpure (
+      # The whole pytest suite, including the handful of tests that fetch real
+      # URLs over the internet (w3.org PDFs, images.dog.ceo). The pure-impure
+      # trick turns this into a fixed-output derivation, which Nix grants network
+      # access, so the *entire* suite runs inside `nix flake check`. (The markers
+      # reliability/extra/llm_call/deno are still skipped by conftest, and the
+      # litellm test server binds to loopback.)
+      pytest = makePureImpure (
         pkgs.stdenv.mkDerivation {
-          name = "dspy-pytest-network";
+          name = "dspy-pytest";
           src = ./.;
           dontUnpack = true;
 
@@ -251,9 +211,10 @@
             cp -r "$src" source
             chmod -R u+w source
             cd source
+            # Make the `tests` package importable (root conftest does
+            # `from tests.test_utils...`).
             export PYTHONPATH="$PWD''${PYTHONPATH:+:$PYTHONPATH}"
-            python -m pytest -p no:cacheprovider -vv \
-              ${lib.concatStringsSep " \\\n              " networkTests}
+            python -m pytest -p no:cacheprovider -vv tests/
           '';
         }
       );
@@ -269,14 +230,14 @@
       devShells.${system}.default = devShell;
 
       # `nix flake check` builds every entry here: every package, every devShell,
-      # the lint gate, the offline pytest suite, and — via the pure-impure trick
-      # — the internet-dependent tests too. So the whole suite runs in pure Nix.
+      # the lint gate, and the full pytest suite (which, via the pure-impure
+      # trick, includes the internet-dependent tests). So the whole suite runs in
+      # pure Nix.
       checks.${system} = {
         inherit
           dspy
           lint
           pytest
-          pytestNetwork
           ;
         test-env = testVenv;
         devShell = devShell;
