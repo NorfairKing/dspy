@@ -201,6 +201,9 @@
         runtimeInputs = [
           testVenv
           pkgs.cacert
+          # coreutils for mktemp/mkdir etc.; the impure runner does not put them
+          # on PATH for us.
+          pkgs.coreutils
         ];
         text = ''
           HOME="$(mktemp -d)"
