@@ -39,6 +39,41 @@
       python = pkgs.python313;
 
       # ----------------------------------------------------------------------
+      # pure-impure trick
+      # ----------------------------------------------------------------------
+      #
+      # Duplicated (not depended upon) from
+      # https://github.com/NorfairKing/pure-impure-nix
+      #
+      # Turns a `buildCommand`-based derivation that wants internet access into a
+      # fixed-output derivation, which Nix grants network access. We only care
+      # whether it *succeeds*, not about its output: $out is replaced by a magic
+      # string derived from the derivation's own store hash, so the output hash
+      # is known up front (and changes whenever the derivation changes, forcing a
+      # rebuild instead of caching a stale success forever).
+      makePureImpure =
+        drv:
+        drv.overrideAttrs (
+          old:
+          let
+            magicString = builtins.unsafeDiscardStringContext (
+              builtins.substring 0 12 (baseNameOf drv.drvPath)
+            );
+            outputHashAlgo = "sha256";
+            outputHash = builtins.hashString outputHashAlgo magicString;
+          in
+          {
+            preferHashedMirrors = false;
+            inherit outputHashAlgo outputHash;
+            buildCommand = ''
+              ${old.buildCommand or ""}
+              rm -rf $out
+              echo -n "${magicString}" > $out
+            '';
+          }
+        );
+
+      # ----------------------------------------------------------------------
       # Full dependency closure from uv.lock, via uv2nix.
       # ----------------------------------------------------------------------
 
@@ -73,6 +108,18 @@
       testVenv = pythonSet.mkVirtualEnv "dspy-test-env" (
         workspace.deps.default // { dspy = [ "dev" ]; }
       );
+
+      # The tests that fetch real URLs over the internet (w3.org PDFs,
+      # images.dog.ceo). Listed once and used both to deselect them from the pure
+      # offline run and to select them for the pure-impure run.
+      networkTests = [
+        "tests/signatures/test_adapter_image.py::test_pdf_url_support"
+        "tests/signatures/test_adapter_image.py::test_different_mime_types"
+        "tests/signatures/test_adapter_image.py::test_mime_type_from_response_headers"
+        "tests/signatures/test_adapter_image.py::test_pdf_from_file"
+        "tests/signatures/test_adapter_image.py::test_image_input_formats"
+        "tests/signatures/test_adapter_image.py::test_predictor_save_load"
+      ];
 
       # ----------------------------------------------------------------------
       # Simple, dependency-light outputs.
@@ -153,9 +200,10 @@
         '';
       };
 
-      # Run the default pytest suite (the markers reliability/extra/llm_call/deno
-      # are skipped unless their --flags are passed, so this is the network-free
-      # unit suite, with the litellm test server bound to loopback).
+      # The default pytest suite, minus the handful of tests that need real
+      # internet access. This is a fully pure, deterministic, network-free build
+      # (the markers reliability/extra/llm_call/deno are skipped by conftest, and
+      # the litellm test server binds to loopback).
       pytest = pkgs.stdenvNoCC.mkDerivation {
         name = "dspy-pytest";
         src = ./.;
@@ -172,17 +220,8 @@
           # Make the `tests` package importable (root conftest does
           # `from tests.test_utils...`).
           export PYTHONPATH="$PWD''${PYTHONPATH:+:$PYTHONPATH}"
-          # These tests fetch real URLs over the internet (w3.org PDFs,
-          # images.dog.ceo), which a pure Nix build deliberately has no network
-          # for. They are exercised by the impure NixCI test instead (see
-          # packages.impure-test). Everything else runs here.
           python -m pytest -p no:cacheprovider -vv tests/ \
-            --deselect "tests/signatures/test_adapter_image.py::test_pdf_url_support" \
-            --deselect "tests/signatures/test_adapter_image.py::test_different_mime_types" \
-            --deselect "tests/signatures/test_adapter_image.py::test_mime_type_from_response_headers" \
-            --deselect "tests/signatures/test_adapter_image.py::test_pdf_from_file" \
-            --deselect "tests/signatures/test_adapter_image.py::test_image_input_formats" \
-            --deselect "tests/signatures/test_adapter_image.py::test_predictor_save_load"
+            ${lib.concatMapStringsSep " \\\n            " (t: ''--deselect "${t}"'') networkTests}
           runHook postCheck
         '';
 
@@ -191,30 +230,33 @@
         '';
       };
 
-      # The full test suite, including the tests that need real internet access
-      # (the w3.org / images.dog.ceo fetches). Building this derivation is pure
-      # (it is just a wrapper script around the venv); *running* it needs network,
-      # so it is executed by NixCI's impure test runner via `nix run` — see the
-      # `test` section of nix-ci.nix.
-      impureTest = pkgs.writeShellApplication {
-        name = "dspy-impure-test";
-        runtimeInputs = [
-          testVenv
-          pkgs.cacert
-          # coreutils for mktemp/mkdir etc.; the impure runner does not put them
-          # on PATH for us.
-          pkgs.coreutils
-        ];
-        text = ''
-          HOME="$(mktemp -d)"
-          export HOME
-          export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
-          # NixCI runs this with `in-repo = true`, so $PWD is a checkout of the
-          # repo; make its `dspy`/`tests` packages importable.
-          export PYTHONPATH="$PWD''${PYTHONPATH:+:$PYTHONPATH}"
-          exec python -m pytest -p no:cacheprovider -vv tests/
-        '';
-      };
+      # The internet-dependent tests, run with the pure-impure trick so they
+      # still execute inside `nix flake check` (the fixed-output derivation is
+      # granted network access). Kept as a small separate derivation so the heavy
+      # offline suite above stays a normal, fully reproducible pure build.
+      pytestNetwork = makePureImpure (
+        pkgs.stdenv.mkDerivation {
+          name = "dspy-pytest-network";
+          src = ./.;
+          dontUnpack = true;
+
+          nativeBuildInputs = [
+            testVenv
+            pkgs.cacert
+          ];
+
+          buildCommand = ''
+            export HOME="$TMPDIR"
+            export SSL_CERT_FILE="${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt"
+            cp -r "$src" source
+            chmod -R u+w source
+            cd source
+            export PYTHONPATH="$PWD''${PYTHONPATH:+:$PYTHONPATH}"
+            python -m pytest -p no:cacheprovider -vv \
+              ${lib.concatStringsSep " \\\n              " networkTests}
+          '';
+        }
+      );
     in
     {
       packages.${system} = {
@@ -222,19 +264,21 @@
         inherit dspy;
         # The full test virtualenv, exposed so it can be built/inspected directly.
         test-env = testVenv;
-        # Impure full-suite test runner (used by nix-ci.nix's test job).
-        impure-test = impureTest;
       };
 
       devShells.${system}.default = devShell;
 
       # `nix flake check` builds every entry here: every package, every devShell,
-      # the lint gate, and the pytest suite.
+      # the lint gate, the offline pytest suite, and — via the pure-impure trick
+      # — the internet-dependent tests too. So the whole suite runs in pure Nix.
       checks.${system} = {
-        inherit dspy lint pytest;
+        inherit
+          dspy
+          lint
+          pytest
+          pytestNetwork
+          ;
         test-env = testVenv;
-        # Building the impure runner is pure (it does not run the tests).
-        impure-test = impureTest;
         devShell = devShell;
       };
     };
